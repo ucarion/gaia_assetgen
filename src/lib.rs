@@ -1,9 +1,10 @@
 #[macro_use]
 extern crate error_chain;
 #[macro_use]
+extern crate log;
+#[macro_use]
 extern crate serde_derive;
 
-extern crate colored;
 extern crate geo;
 extern crate geojson;
 extern crate serde;
@@ -16,7 +17,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
-use colored::Colorize;
 use geojson::GeoJson;
 use geojson::conversion::TryInto;
 use geo::boundingbox::BoundingBox;
@@ -31,7 +31,7 @@ use errors::*;
 pub const ELEVATION_OFFSET: u16 = 500;
 
 // This is just for logging purposes
-const NUM_STEPS: u32 = 6;
+const NUM_STEPS: u32 = 7;
 
 const MAX_LEVEL: u32 = 6;
 const ELEVATION_TILE_SIZE: u32 = 64;
@@ -68,6 +68,8 @@ pub struct PolygonPointData {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MultiLevelPolygon {
     pub properties: serde_json::Map<String, serde_json::Value>,
+    /// `(min, max)` along x- and y-axis
+    pub bounding_box: [(f32, f32); 2],
     pub levels: Vec<Vec<(f32, f32)>>,
 }
 
@@ -152,6 +154,8 @@ impl PrepareAssetsTask {
         for level in 0..MAX_LEVEL + 1 {
             self.create_tile_level(level)?;
         }
+
+        self.copy_blue_marble_crops()?;
 
         self.create_polygon_data()?;
 
@@ -543,7 +547,7 @@ impl PrepareAssetsTask {
                 let max = (max * u16::max_value() as f32) as u16;
 
                 let metadata_path = self.tiles_dir().join(format!(
-                    "{}_{}_{}.json",
+                    "{}_{}_{}-first-pass.json",
                     level,
                     tile_x,
                     tile_y
@@ -567,11 +571,43 @@ impl PrepareAssetsTask {
         Ok(())
     }
 
-    fn create_polygon_data(&self) -> Result<()> {
-        // if self.output_dir.join("polygons.json").is_file() {
-        //     return Ok(())
-        // }
+    fn copy_blue_marble_crops(&self) -> Result<()> {
+        if self.tiles_dir().join("0_0_0.jpg").is_file() {
+            return Ok(());
+        }
 
+        self.pretty_log(5, 1, 1, "Copying Blue Marble crops to tiles directory");
+
+        for level in 0..MAX_LEVEL + 1 {
+            let num_crops_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
+            let num_crops_across_height = num_crops_across_width / 2;
+
+            for tile_y in 0..num_crops_across_height {
+                for tile_x in 0..num_crops_across_width {
+                    let crop = self.crops_dir().join(format!(
+                        "{}_{}_{}.jpg",
+                        level,
+                        tile_x,
+                        tile_y
+                    ));
+                    let tile = self.tiles_dir().join(format!(
+                        "{}_{}_{}.jpg",
+                        level,
+                        tile_x,
+                        tile_y
+                    ));
+
+                    std::fs::copy(crop, tile).chain_err(
+                        || "Error copying Blue Marble crop to tiles directory",
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_polygon_data(&self) -> Result<()> {
         let mut features_file = File::open(&self.features_file).chain_err(
             || "Could not open features file",
         )?;
@@ -614,8 +650,12 @@ impl PrepareAssetsTask {
     }
 
     fn create_final_tile_metadatas(&self, polygons: &[geo::Polygon<f32>]) -> Result<()> {
+        if self.tiles_dir().join("0_0_0.json").is_file() {
+            return Ok(());
+        }
+
         let mut tile_metadatas: BTreeMap<(u32, u32, u32), Vec<u64>> = BTreeMap::new();
-        self.pretty_log(5, 1, 1, "Generating tile metadata files");
+        self.pretty_log(6, 1, 1, "Generating tile metadata files");
 
         for level in 0..MAX_LEVEL + 1 {
             let num_tiles_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
@@ -650,13 +690,17 @@ impl PrepareAssetsTask {
 
             for x in 0..num_tiles_across_width {
                 for y in 0..num_tiles_across_height {
-                    let metadata_path =
-                        self.tiles_dir().join(format!("{}_{}_{}.json", level, x, y));
-                    let metadata_file = File::open(&metadata_path).chain_err(
+                    let first_pass_metadata_path = self.tiles_dir().join(format!(
+                        "{}_{}_{}-first-pass.json",
+                        level,
+                        x,
+                        y
+                    ));
+                    let first_pass_metadata_file = File::open(&first_pass_metadata_path).chain_err(
                         || "Unable to read in first pass metadata",
                     )?;
                     let first_pass_metadata: FirstPassTileMetadata =
-                        serde_json::from_reader(metadata_file).chain_err(
+                        serde_json::from_reader(first_pass_metadata_file).chain_err(
                             || "Error parsing first pass metadata",
                         )?;
 
@@ -671,13 +715,19 @@ impl PrepareAssetsTask {
                         polygons: polygons.clone(),
                     };
 
+                    let metadata_path = self.tiles_dir().join(format!(
+                        "{}_{}_{}.json",
+                        level,
+                        x,
+                        y
+                    ));
                     let mut metadata_file = File::create(metadata_path).chain_err(
-                        || "Unable to open metadata file",
+                        || "Unable to open final metadata file",
                     )?;
 
                     let to_write = serde_json::to_string(&tile_metadata).unwrap();
                     metadata_file.write_all(to_write.as_bytes()).chain_err(
-                        || "Error writing out tile metadata",
+                        || "Error writing out final tile metadata",
                     )?;
                 }
             }
@@ -691,7 +741,11 @@ impl PrepareAssetsTask {
         polygons: &[geo::Polygon<f32>],
         polygon_properties: &[serde_json::Map<String, serde_json::Value>],
     ) -> Result<()> {
-        self.pretty_log(6, 1, 1, "Generating polygon point data file");
+        if self.output_dir.join("polygons.json").is_file() {
+            return Ok(());
+        }
+
+        self.pretty_log(7, 1, 1, "Generating polygon point data file");
 
         let multi_level_polygons = polygons
             .iter()
@@ -714,7 +768,10 @@ impl PrepareAssetsTask {
                     })
                     .collect();
 
+                let bbox = polygon.bbox().unwrap();
+
                 MultiLevelPolygon {
+                    bounding_box: [(bbox.xmin, bbox.xmax), (bbox.ymin, bbox.ymax)],
                     properties: properties.clone(),
                     levels: levels,
                 }
@@ -737,7 +794,7 @@ impl PrepareAssetsTask {
     }
 
     fn pretty_log(&self, step: u32, sub_step: u32, num_sub_steps: u32, message: &str) {
-        let to_print = format!(
+        info!(
             "[{}/{}] [{}/{}]: {}",
             step,
             NUM_STEPS,
@@ -745,8 +802,6 @@ impl PrepareAssetsTask {
             num_sub_steps,
             message
         );
-
-        println!("{}", to_print.bold().green());
     }
 
     fn crops_dir(&self) -> PathBuf {
