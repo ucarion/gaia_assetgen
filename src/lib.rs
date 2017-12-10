@@ -53,7 +53,7 @@ struct FirstPassTileMetadata {
     max_elevation: u16,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TileMetadata {
     pub min_elevation: u16,
     pub max_elevation: u16,
@@ -696,13 +696,13 @@ impl PrepareAssetsTask {
                         x,
                         y
                     ));
-                    let first_pass_metadata_file = File::open(&first_pass_metadata_path).chain_err(
-                        || "Unable to read in first pass metadata",
-                    )?;
-                    let first_pass_metadata: FirstPassTileMetadata =
-                        serde_json::from_reader(first_pass_metadata_file).chain_err(
-                            || "Error parsing first pass metadata",
+                    let first_pass_metadata_file =
+                        File::open(&first_pass_metadata_path).chain_err(
+                            || "Unable to read in first pass metadata",
                         )?;
+                    let first_pass_metadata: FirstPassTileMetadata =
+                        serde_json::from_reader(first_pass_metadata_file)
+                            .chain_err(|| "Error parsing first pass metadata")?;
 
                     let default_polygons = Vec::new();
                     let polygons = tile_metadatas.get(&(level, x, y)).unwrap_or(
@@ -715,12 +715,8 @@ impl PrepareAssetsTask {
                         polygons: polygons.clone(),
                     };
 
-                    let metadata_path = self.tiles_dir().join(format!(
-                        "{}_{}_{}.json",
-                        level,
-                        x,
-                        y
-                    ));
+                    let metadata_path =
+                        self.tiles_dir().join(format!("{}_{}_{}.json", level, x, y));
                     let mut metadata_file = File::create(metadata_path).chain_err(
                         || "Unable to open final metadata file",
                     )?;
@@ -757,21 +753,26 @@ impl PrepareAssetsTask {
                             polygon.simplify(&self.simplification_epsilons[level as usize]);
                         let mut points = Vec::new();
 
-                        points.extend(polygon.exterior.into_iter().map(
-                            |point| (point.x(), point.y()),
-                        ));
+                        points.extend(polygon.exterior.into_iter().map(map_point_to_coords));
                         for ring in polygon.interiors {
-                            points.extend(ring.into_iter().map(|point| (point.x(), point.y())));
+                            points.extend(ring.into_iter().map(map_point_to_coords));
                         }
 
-                        points
+                        if points.len() > 2 {
+                            points
+                        } else {
+                            vec![]
+                        }
                     })
                     .collect();
 
                 let bbox = polygon.bbox().unwrap();
 
                 MultiLevelPolygon {
-                    bounding_box: [(bbox.xmin, bbox.xmax), (bbox.ymin, bbox.ymax)],
+                    bounding_box: [
+                        (map_x_to_coords(bbox.xmin), map_x_to_coords(bbox.xmax)),
+                        (map_y_to_coords(bbox.ymax), map_y_to_coords(bbox.ymin)),
+                    ],
                     properties: properties.clone(),
                     levels: levels,
                 }
@@ -811,4 +812,18 @@ impl PrepareAssetsTask {
     fn tiles_dir(&self) -> PathBuf {
         self.output_dir.join("tiles")
     }
+}
+
+fn map_point_to_coords(point: geo::Point<f32>) -> (f32, f32) {
+    (map_x_to_coords(point.x()), map_y_to_coords(point.y()))
+}
+
+/// Map [-180, 180] to [0, 2]
+fn map_x_to_coords(x: f32) -> f32 {
+    (x + 180.0) / 180.0
+}
+
+/// Map [-90, 90] to [0, 1]
+fn map_y_to_coords(y: f32) -> f32 {
+    (y + 90.0) / 180.0
 }
