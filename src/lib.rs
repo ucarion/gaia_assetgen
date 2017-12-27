@@ -37,7 +37,7 @@ pub const MAX_LEVEL: u8 = 6;
 /// TILES_ACROSS_MAX_LEVEL_WIDTH).
 ///
 /// (21600 / 32 = 675).
-const IMAGERY_TILE_SIZE: u32 = 675;
+pub const IMAGERY_TILE_SIZE: u32 = 675;
 
 /// How many tiles at the greatest level of detail are to be created from a NASA tile. A NASA tile
 /// is a quarter of the width of the world, and there are TILES_ACROSS_MAX_LEVEL_WIDTH = 128 tiles
