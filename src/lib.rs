@@ -1,57 +1,75 @@
 #[macro_use]
 extern crate error_chain;
 #[macro_use]
-extern crate log;
-#[macro_use]
 extern crate serde_derive;
 
 extern crate geo;
 extern crate geojson;
 extern crate serde;
 extern crate serde_json;
+extern crate tempdir;
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::str::FromStr;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use geojson::GeoJson;
 use geojson::conversion::TryInto;
 use geo::boundingbox::BoundingBox;
-use geo::simplify::Simplify;
+use geo::simplifyvw::SimplifyVW;
+use tempdir::TempDir;
 
-mod errors {
-    error_chain!{}
-}
+mod errors;
+mod imagemagick;
 
 use errors::*;
+use imagemagick::Convert;
 
 pub const ELEVATION_OFFSET: u16 = 500;
 
-// This is just for logging purposes
-const NUM_STEPS: u32 = 7;
+/// The maximum level of detail to be created. This value plus one is how many levels exist,
+/// because the least-detailed level is zero.
+pub const MAX_LEVEL: u8 = 6;
 
-const MAX_LEVEL: u32 = 6;
-const ELEVATION_TILE_SIZE: u32 = 64;
-const PIXELS_PER_TILE: u32 = 256;
+/// The size of satellite imagery tiles. This should be equal to the size of a NASA tile (21600)
+/// divided by how many tiles are to be made from them (32 -- a quarter of
+/// TILES_ACROSS_MAX_LEVEL_WIDTH).
+///
+/// (21600 / 32 = 675).
+const IMAGERY_TILE_SIZE: u32 = 675;
 
-const TILES_ACROSS_WIDTH: u32 = 128;
-const NASA_TILES_ACROSS_WIDTH: u32 = 4;
+/// How many tiles at the greatest level of detail are to be created from a NASA tile. A NASA tile
+/// is a quarter of the width of the world, and there are TILES_ACROSS_MAX_LEVEL_WIDTH = 128 tiles
+/// across the width.  Thus, there are 128/4 = 32 tiles across a single NASA tile.
+const TILES_ACROSS_NASA_TILE: u32 = 32;
 
-// Constants relating to NOAA GLOBE data
-const NOAA_TILE_WIDTH: u32 = 10800;
-const NOAA_TILE_HEIGHT_TOP: u32 = 4800;
-const NOAA_TILE_HEIGHT_MIDDLE: u32 = 6000;
+/// The size of an elevation tile.
+///
+/// This should be a power of two plus one, so that it can be combined with another tile that has
+/// one column of overlap to produce another tile of power of two plus one.
+pub const ELEVATION_TILE_SIZE: u32 = 129;
 
-// The metadata for the tile metadata on the first pass; only maxima and minima, computed by
-// Imagemagick, are present.
+/// The size of an elevation crop. This should be ELEVATION_TILE_SIZE - 1.
+const ELEVATION_CROP_SIZE: u32 = 128;
+
+/// How many *crops* -- not tiles -- to generate from the width of a single NOAA tile.
+const CROPS_ACROSS_NOAA_TILE: u32 = 32;
+
+/// Prior to creating the crops, what size to resize NOAA tiles to. This is CROPS_ACROSS_NOAA_TILE
+/// * ELEVATION_CROP_SIZE.
+const NOAA_TILE_RESIZE_WIDTH: u32 = 4096;
+
+/// The metadata for the tile metadata on the first pass; only maxima and minima, computed by
+/// Imagemagick, are present. These elevations are correct -- they do not need to be offset by
+/// ELEVATION_OFFSET.
 #[derive(Serialize, Deserialize, Debug)]
 struct FirstPassTileMetadata {
     min_elevation: u16,
     max_elevation: u16,
 }
+
+pub type PolygonProperties = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TileMetadata {
@@ -67,9 +85,10 @@ pub struct PolygonPointData {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MultiLevelPolygon {
-    pub properties: serde_json::Map<String, serde_json::Value>,
+    pub properties: PolygonProperties,
     /// `(min, max)` along x- and y-axis
     pub bounding_box: [(f32, f32); 2],
+    /// The same polygon simplified according to epsilons in `simplification_epsilons`.
     pub levels: Vec<Vec<(f32, f32)>>,
 }
 
@@ -132,475 +151,435 @@ impl PrepareAssetsTask {
     }
 
     pub fn run(&self) -> Result<()> {
-        if !self.crops_dir().is_dir() {
-            std::fs::create_dir(&self.crops_dir()).chain_err(
-                || "Could not create crops directory",
-            )?;
-        }
-
         if !self.tiles_dir().is_dir() {
-            std::fs::create_dir(&self.tiles_dir()).chain_err(
+            fs::create_dir(&self.tiles_dir()).chain_err(
                 || "Could not create tiles directory",
             )?;
         }
 
-        self.create_nasa_level0_crops()?;
-        self.create_noaa_level0_crops()?;
-
-        for level in 1..MAX_LEVEL + 1 {
-            self.create_crop_level(level)?;
+        self.create_nasa_max_level_tiles()?;
+        for level in (0..MAX_LEVEL).rev() {
+            self.create_nasa_level(level)?;
         }
 
-        for level in 0..MAX_LEVEL + 1 {
-            self.create_tile_level(level)?;
-        }
+        let temp_crop_dir = TempDir::new(&format!("crops")).chain_err(
+            || "Error creating temporary dir",
+        )?;
 
-        self.copy_blue_marble_crops()?;
+        self.create_noaa_max_level_crops(&temp_crop_dir.path())?;
+        self.create_noaa_level(&temp_crop_dir.path(), MAX_LEVEL)?;
+        for level in (0..MAX_LEVEL).rev() {
+            self.create_noaa_crop_level(&temp_crop_dir.path(), level)?;
+            self.create_noaa_level(&temp_crop_dir.path(), level)?;
+        }
 
         self.create_polygon_data()?;
 
         Ok(())
     }
 
-    fn create_nasa_level0_crops(&self) -> Result<()> {
-        if self.crops_dir().join("0_0_0.jpg").is_file() {
+    fn create_nasa_max_level_tiles(&self) -> Result<()> {
+        let test_file = format!("{}_0_0.jpg", MAX_LEVEL);
+        if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
 
-        for y in 0..2 {
-            for x in 0..4 {
-                self.crop_blue_marble_tile(x, y)?;
-            }
-        }
+        self.create_nasa_max_level_tile(
+            "A1",
+            TILES_ACROSS_NASA_TILE * 0,
+            TILES_ACROSS_NASA_TILE,
+        )?;
+        self.create_nasa_max_level_tile(
+            "A2",
+            TILES_ACROSS_NASA_TILE * 0,
+            0,
+        )?;
+        self.create_nasa_max_level_tile(
+            "B1",
+            TILES_ACROSS_NASA_TILE * 1,
+            TILES_ACROSS_NASA_TILE,
+        )?;
+        self.create_nasa_max_level_tile(
+            "B2",
+            TILES_ACROSS_NASA_TILE * 1,
+            0,
+        )?;
+        self.create_nasa_max_level_tile(
+            "C1",
+            TILES_ACROSS_NASA_TILE * 2,
+            TILES_ACROSS_NASA_TILE,
+        )?;
+        self.create_nasa_max_level_tile(
+            "C2",
+            TILES_ACROSS_NASA_TILE * 2,
+            0,
+        )?;
+        self.create_nasa_max_level_tile(
+            "D1",
+            TILES_ACROSS_NASA_TILE * 3,
+            TILES_ACROSS_NASA_TILE,
+        )?;
+        self.create_nasa_max_level_tile(
+            "D2",
+            TILES_ACROSS_NASA_TILE * 3,
+            0,
+        )?;
 
         Ok(())
     }
 
-    fn crop_blue_marble_tile(&self, x: u32, y: u32) -> Result<()> {
-        self.pretty_log(
-            1,
-            1 + x + y * NASA_TILES_ACROSS_WIDTH,
-            NASA_TILES_ACROSS_WIDTH * NASA_TILES_ACROSS_WIDTH / 2,
-            &format!("Resizing and cropping Blue Marble tile {}.{}", x, y),
-        );
-
-        let name_offset_x = x * TILES_ACROSS_WIDTH / NASA_TILES_ACROSS_WIDTH;
-        let name_offset_y = y * TILES_ACROSS_WIDTH / NASA_TILES_ACROSS_WIDTH;
-        let name_template_x = format!("%[fx:page.x / {} + {}]", PIXELS_PER_TILE, name_offset_x);
-        let name_template_y = format!("%[fx:page.y / {} + {}]", PIXELS_PER_TILE, name_offset_y);
-        let name_template = format!("0_{}_{}.jpg", name_template_x, name_template_y);
-
-        let tile_name = format!(
-            "{}{}",
-            ['A', 'B', 'C', 'D'][x as usize],
-            ['1', '2'][y as usize]
-        );
-        let tile_file_name = format!("world.topo.bathy.200412.3x21600x21600.{}.jpg", tile_name);
-        let tile_path = self.nasa_blue_marble_dir.join(tile_file_name);
-
-        let resize_size = PIXELS_PER_TILE * TILES_ACROSS_WIDTH / NASA_TILES_ACROSS_WIDTH;
-        let crop_size = format!("{}x{}", PIXELS_PER_TILE, PIXELS_PER_TILE);
-
-        let output = Command::new("convert")
-            .arg("-monitor")
-            .arg(tile_path)
-            .args(&["-resize", &resize_size.to_string()])
-            .args(&["-crop", &crop_size])
-            .args(&["-set", "filename:tile", &name_template])
-            .args(&["+repage", "+adjoin"])
-            .arg(self.crops_dir().join("%[filename:tile]"))
-            .stderr(Stdio::inherit())
-            .output()
-            .chain_err(|| "Error while running `convert`")?;
-
-        if !output.status.success() {
-            return Err("`convert` returned with non-zero exit status".into());
-        }
-
-        Ok(())
-    }
-
-    fn create_noaa_level0_crops(&self) -> Result<()> {
-        if self.crops_dir().join("0_0_0.elevation").is_file() {
-            return Ok(());
-        }
-
-        self.pretty_log(2, 1, 4, "Cropping GLOBE tile quadrant 1");
-        self.crop_noaa_tile_quadrant(
-            (0, 0),
-            (NOAA_TILE_HEIGHT_TOP, NOAA_TILE_HEIGHT_MIDDLE),
-            ["a10g", "b10g", "e10g", "f10g"],
-        )?;
-        self.pretty_log(2, 2, 4, "Cropping GLOBE tile quadrant 2");
-        self.crop_noaa_tile_quadrant(
-            (64, 0),
-            (NOAA_TILE_HEIGHT_TOP, NOAA_TILE_HEIGHT_MIDDLE),
-            ["c10g", "d10g", "g10g", "h10g"],
-        )?;
-        self.pretty_log(2, 3, 4, "Cropping GLOBE tile quadrant 3");
-        self.crop_noaa_tile_quadrant(
-            (0, 32),
-            (NOAA_TILE_HEIGHT_MIDDLE, NOAA_TILE_HEIGHT_TOP),
-            ["i10g", "j10g", "m10g", "n10g"],
-        )?;
-        self.pretty_log(2, 4, 4, "Cropping GLOBE tile quadrant 4");
-        self.crop_noaa_tile_quadrant(
-            (64, 32),
-            (NOAA_TILE_HEIGHT_MIDDLE, NOAA_TILE_HEIGHT_TOP),
-            ["k10g", "l10g", "o10g", "p10g"],
-        )?;
-        Ok(())
-    }
-
-    fn crop_noaa_tile_quadrant(
+    fn create_nasa_max_level_tile(
         &self,
-        name_offset: (u32, u32),
-        tile_heights: (u32, u32),
-        tiles: [&str; 4],
+        nasa_tile: &str,
+        x_offset: u32,
+        y_offset: u32,
     ) -> Result<()> {
-        let name_template_x = format!("%[fx:page.x / {} + {}]", ELEVATION_TILE_SIZE, name_offset.0);
-        let name_template_y = format!("%[fx:page.y / {} + {}]", ELEVATION_TILE_SIZE, name_offset.1);
-        let name_template = format!("0_{}_{}.elevation", name_template_x, name_template_y);
+        let temp_dir = TempDir::new(&format!("nasa_{}", nasa_tile)).chain_err(
+            || "Error creating temporary dir",
+        )?;
 
-        let top_left = self.noaa_globe_dir.join(tiles[0]);
-        let top_right = self.noaa_globe_dir.join(tiles[1]);
-        let top_size = format!("{}x{}", NOAA_TILE_WIDTH, tile_heights.0);
+        let file_name = format!("world.topo.bathy.200412.3x21600x21600.{}.jpg", nasa_tile);
 
-        let bottom_left = self.noaa_globe_dir.join(tiles[2]);
-        let bottom_right = self.noaa_globe_dir.join(tiles[3]);
-        let bottom_size = format!("{}x{}", NOAA_TILE_WIDTH, tile_heights.1);
+        Convert::new()
+            .monitor()
+            .input(&self.nasa_blue_marble_dir.join(file_name))
+            .crops(IMAGERY_TILE_SIZE)
+            .output(&temp_dir.path().join("out.jpg"))
+            .run()?;
 
-        let offset_resize_and_append = &[
-            "-evaluate",
-            "addmodulus",
-            &ELEVATION_OFFSET.to_string(),
-            "-resize",
-            &(ELEVATION_TILE_SIZE * TILES_ACROSS_WIDTH / 4).to_string(),
-            "+append",
-        ];
-        let top_row = &[
-            "-size",
-            &top_size,
-            &format!("gray:{}", top_left.to_string_lossy()),
-            &format!("gray:{}", top_right.to_string_lossy()),
-        ];
-        let bottom_row = &[
-            "-size",
-            &bottom_size,
-            &format!("gray:{}", bottom_left.to_string_lossy()),
-            &format!("gray:{}", bottom_right.to_string_lossy()),
-        ];
+        for x in 0..TILES_ACROSS_NASA_TILE {
+            for y in 0..TILES_ACROSS_NASA_TILE {
+                let inverted_y = TILES_ACROSS_NASA_TILE - 1 - y;
+                let crop_filename = format!("out-{}.jpg", inverted_y * TILES_ACROSS_NASA_TILE + x);
+                let crop_path = temp_dir.path().join(crop_filename);
 
-        let crop_size = format!("{}x{}", ELEVATION_TILE_SIZE, ELEVATION_TILE_SIZE);
-        let out_file = format!(
-            "gray:{}",
-            self.crops_dir().join("%[filename:tile]").to_string_lossy()
-        );
+                let tile_filename = format!("{}_{}_{}.jpg", MAX_LEVEL, x_offset + x, y_offset + y);
+                let tile_path = self.tiles_dir().join(tile_filename);
 
-        let output = Command::new("convert")
-            .arg("-monitor")
-            .args(&["-depth", "16"])
-            .arg("(")
-            .arg("-monitor")
-            .args(top_row)
-            .args(&offset_resize_and_append.clone())
-            .arg(")")
-            .arg("(")
-            .arg("-monitor")
-            .args(bottom_row)
-            .args(&offset_resize_and_append.clone())
-            .arg(")")
-            .arg("-append")
-            .args(&["-crop", &crop_size])
-            .args(&["-set", "filename:tile", &name_template])
-            .args(&["+repage", "+adjoin"])
-            .arg(&out_file)
-            .stderr(Stdio::inherit())
-            .output()
-            .chain_err(|| "Error while running `convert`")?;
-
-        if !output.status.success() {
-            return Err("`convert` returned with non-zero exit status".into());
-        }
-
-        Ok(())
-    }
-
-    fn create_crop_level(&self, level: u32) -> Result<()> {
-        if self.crops_dir()
-            .join(format!("{}_0_0.jpg", level))
-            .is_file()
-        {
-            return Ok(());
-        }
-
-        self.pretty_log(
-            3,
-            level,
-            MAX_LEVEL,
-            &format!("Generating crops for level {}", level),
-        );
-
-        let num_crops_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
-        let num_crops_across_height = num_crops_across_width / 2;
-
-        for crop_y in 0..num_crops_across_height {
-            for crop_x in 0..num_crops_across_width {
-                let left_x = crop_x * 2;
-                let right_x = left_x + 1;
-                let top_y = crop_y * 2;
-                let bottom_y = top_y + 1;
-
-                let top_left = format!("{}_{}_{}", level - 1, left_x, top_y);
-                let top_right = format!("{}_{}_{}", level - 1, right_x, top_y);
-                let bottom_left = format!("{}_{}_{}", level - 1, left_x, bottom_y);
-                let bottom_right = format!("{}_{}_{}", level - 1, right_x, bottom_y);
-
-                let elevation_crop_size =
-                    format!("{}x{}", ELEVATION_TILE_SIZE, ELEVATION_TILE_SIZE);
-
-                let resize_and_append = vec!["-resize", "50%", "+append"];
-
-                let out_crop = format!("{}_{}_{}", level, crop_x, crop_y);
-                let output = Command::new("convert")
-                    .arg("(")
-                    .arg(self.crops_dir().join(format!("{}.jpg", top_left)))
-                    .arg(self.crops_dir().join(format!("{}.jpg", top_right)))
-                    .args(resize_and_append.clone())
-                    .arg(")")
-                    .arg("(")
-                    .arg(self.crops_dir().join(format!("{}.jpg", bottom_left)))
-                    .arg(self.crops_dir().join(format!("{}.jpg", bottom_right)))
-                    .args(resize_and_append.clone())
-                    .arg(")")
-                    .arg("-append")
-                    .arg(self.crops_dir().join(format!("{}.jpg", out_crop)))
-                    .stderr(Stdio::inherit())
-                    .output()
-                    .chain_err(|| "Error while running `convert`")?;
-
-                if !output.status.success() {
-                    return Err("`convert` returned with non-zero exit status".into());
-                }
-
-                let top_left = self.crops_dir().join(top_left).with_extension("elevation");
-                let top_right = self.crops_dir().join(top_right).with_extension("elevation");
-                let bottom_left = self.crops_dir().join(bottom_left).with_extension(
-                    "elevation",
-                );
-                let bottom_right = self.crops_dir().join(bottom_right).with_extension(
-                    "elevation",
-                );
-                let out_crop = self.crops_dir().join(out_crop).with_extension("elevation");
-
-                let output = Command::new("convert")
-                    .args(&["-depth", "16"])
-                    .args(&["-size", &elevation_crop_size])
-                    .arg("(")
-                    .arg(format!("gray:{}", top_left.to_string_lossy()))
-                    .arg(format!("gray:{}", top_right.to_string_lossy()))
-                    .args(resize_and_append.clone())
-                    .arg(")")
-                    .arg("(")
-                    .arg(format!("gray:{}", bottom_left.to_string_lossy()))
-                    .arg(format!("gray:{}", bottom_right.to_string_lossy()))
-                    .args(resize_and_append.clone())
-                    .arg(")")
-                    .arg("-append")
-                    .arg(format!("gray:{}", out_crop.to_string_lossy()))
-                    .stderr(Stdio::inherit())
-                    .output()
-                    .chain_err(|| "Error while running `convert`")?;
-
-                if !output.status.success() {
-                    return Err("`convert` returned with non-zero exit status".into());
-                }
+                fs::copy(crop_path, tile_path).chain_err(
+                    || "Error copying NASA tile crop",
+                )?;
             }
         }
 
         Ok(())
     }
 
-    fn create_tile_level(&self, level: u32) -> Result<()> {
-        if self.tiles_dir()
-            .join(format!("{}_0_0.elevation", level))
-            .is_file()
-        {
+    fn create_noaa_max_level_crops(&self, temp_crop_dir: &Path) -> Result<()> {
+        let test_file = format!("{}_0_0.elevation", MAX_LEVEL);
+        if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
 
-        self.pretty_log(
-            4,
-            level + 1,
-            MAX_LEVEL + 1,
-            &format!("Generating tiles for level {}", level),
-        );
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            true,
+            "a10g",
+            "e10g",
+            0 * CROPS_ACROSS_NOAA_TILE,
+            1 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            true,
+            "b10g",
+            "f10g",
+            1 * CROPS_ACROSS_NOAA_TILE,
+            1 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            true,
+            "c10g",
+            "g10g",
+            2 * CROPS_ACROSS_NOAA_TILE,
+            1 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            true,
+            "d10g",
+            "h10g",
+            3 * CROPS_ACROSS_NOAA_TILE,
+            1 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            false,
+            "i10g",
+            "m10g",
+            0 * CROPS_ACROSS_NOAA_TILE,
+            0 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            false,
+            "j10g",
+            "n10g",
+            1 * CROPS_ACROSS_NOAA_TILE,
+            0 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            false,
+            "k10g",
+            "o10g",
+            2 * CROPS_ACROSS_NOAA_TILE,
+            0 * CROPS_ACROSS_NOAA_TILE,
+        )?;
+        self.create_noaa_max_level_tile(
+            temp_crop_dir,
+            false,
+            "l10g",
+            "p10g",
+            3 * CROPS_ACROSS_NOAA_TILE,
+            0 * CROPS_ACROSS_NOAA_TILE,
+        )?;
 
-        let num_crops_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
-        let num_crops_across_height = num_crops_across_width / 2;
+        Ok(())
+    }
 
-        for tile_y in 0..num_crops_across_height {
-            for tile_x in 0..num_crops_across_width {
-                // For image tiles, no overlap is needed; just copy the relevant crop
-                let nasa_file_name = format!("{}_{}_{}.jpg", level, tile_x, tile_y);
-                std::fs::copy(
-                    self.crops_dir().join(nasa_file_name.clone()),
-                    self.tiles_dir().join(nasa_file_name.clone()),
-                ).chain_err(|| "Error while copying Blue Marble crop to tiles directory")?;
+    fn create_noaa_max_level_tile(
+        &self,
+        temp_crop_dir: &Path,
+        is_north: bool,
+        top_tile: &str,
+        bottom_tile: &str,
+        x_offset: u32,
+        y_offset: u32,
+    ) -> Result<()> {
+        let (top_height, bottom_height) = if is_north { (4800, 6000) } else { (6000, 4800) };
 
-                // For elevation tiles, we must crop and append tiles together
-                let right_x = (tile_x + 1) % num_crops_across_width;
-                let (below_y, gravity_below) = if tile_y == num_crops_across_height - 1 {
-                    // For the last row, there's a special case. Instead of taking the top of the
-                    // next row as usual, we use the bottom of the current row.
-                    //
-                    // In effect, this duplicates the bottom row of pixels of the bottom row of
-                    // crops.
-                    (tile_y, "southwest")
+        Convert::new()
+            .monitor()
+            .grayscale_input((10800, top_height), &self.noaa_globe_dir.join(top_tile))
+            .grayscale_input(
+                (10800, bottom_height),
+                &self.noaa_globe_dir.join(bottom_tile),
+            )
+            .append_vertically()
+            .offset_each_pixel(ELEVATION_OFFSET)
+            .resize(&format!("{}", NOAA_TILE_RESIZE_WIDTH))
+            .crops(ELEVATION_CROP_SIZE)
+            .grayscale_output(&temp_crop_dir.join("out.elevation"))
+            .run()?;
+
+        for x in 0..CROPS_ACROSS_NOAA_TILE {
+            for y in 0..CROPS_ACROSS_NOAA_TILE {
+                let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
+                let crop_filename =
+                    format!("out-{}.elevation", inverted_y * TILES_ACROSS_NASA_TILE + x);
+                let crop_path = temp_crop_dir.join(crop_filename);
+
+                let out_crop_filename =
+                    format!("{}_{}_{}.elevation", MAX_LEVEL, x_offset + x, y_offset + y);
+                let out_crop_path = temp_crop_dir.join(out_crop_filename);
+
+                fs::copy(crop_path, out_crop_path).chain_err(
+                    || "Error copying NASA tile crop",
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_noaa_crop_level(&self, temp_crop_dir: &Path, level: u8) -> Result<()> {
+        let test_file = format!("{}_0_0.elevation", level);
+        if self.tiles_dir().join(test_file).exists() {
+            return Ok(());
+        }
+
+        let tiles_across_width = 2u32.pow(1 + level as u32);
+        let tiles_across_height = 2u32.pow(level as u32);
+
+        let elevation_crop_size = (ELEVATION_CROP_SIZE, ELEVATION_CROP_SIZE);
+
+        for x in 0..tiles_across_width {
+            for y in 0..tiles_across_height {
+                let crop = format!("{}_{}_{}.elevation", level, x, y);
+
+                let top_y = y * 2 + 1;
+                let bottom_y = y * 2;
+                let left_x = x * 2;
+                let right_x = x * 2 + 1;
+
+                let top_left = format!("{}_{}_{}.elevation", level + 1, left_x, top_y);
+                let top_right = format!("{}_{}_{}.elevation", level + 1, right_x, top_y);
+                let bottom_left = format!("{}_{}_{}.elevation", level + 1, left_x, bottom_y);
+                let bottom_right = format!("{}_{}_{}.elevation", level + 1, right_x, bottom_y);
+
+                Convert::new()
+                    .group(|convert| {
+                        convert
+                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(top_left))
+                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(top_right))
+                            .append_horizontally()
+                    })
+                    .group(|convert| {
+                        convert
+                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(bottom_left))
+                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(bottom_right))
+                            .append_horizontally()
+                    })
+                    .append_vertically()
+                    .resize("50%")
+                    .output(&temp_crop_dir.join(crop))
+                    .run()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_noaa_level(&self, temp_crop_dir: &Path, level: u8) -> Result<()> {
+        let test_file = format!("{}_0_0.elevation", level);
+        if self.tiles_dir().join(test_file).exists() {
+            return Ok(());
+        }
+
+        let elevation_crop_size = (ELEVATION_CROP_SIZE, ELEVATION_CROP_SIZE);
+
+        let tiles_across_width = 2u32.pow(1 + level as u32);
+        let tiles_across_height = 2u32.pow(level as u32);
+
+        for x in 0..tiles_across_width {
+            for y in 0..tiles_across_height {
+                let tile = format!("{}_{}_{}.elevation", level, x, y);
+
+                // copy from bottom and right -- if you're on the bottom row, use your own bottom
+                // row as your "beneath's top row".
+                let (below_y, below_offset_y) = if y == 0 {
+                    (0, ELEVATION_CROP_SIZE - 1)
                 } else {
-                    (tile_y + 1, "northwest")
+                    (y - 1, 0)
                 };
 
-                let elevation_crop_size =
-                    format!("{}x{}", ELEVATION_TILE_SIZE, ELEVATION_TILE_SIZE);
+                let right_x = if x == tiles_across_width - 1 {
+                    0
+                } else {
+                    x + 1
+                };
 
-                let top_left = format!("{}_{}_{}.elevation", level, tile_x, tile_y);
-                let top_right = format!("{}_{}_{}.elevation", level, right_x, tile_y);
-                let bottom_left = format!("{}_{}_{}.elevation", level, tile_x, below_y);
-                let bottom_right = format!("{}_{}_{}.elevation", level, right_x, below_y);
+                let main_crop = format!("{}_{}_{}.elevation", level, x, y);
+                let right_crop = format!("{}_{}_{}.elevation", level, right_x, y);
+                let below_crop = format!("{}_{}_{}.elevation", level, x, below_y);
+                let below_right_crop = format!("{}_{}_{}.elevation", level, right_x, below_y);
 
-                let top_left =
-                    format!("gray:{}", self.crops_dir().join(top_left).to_string_lossy());
-                let top_right = format!(
-                    "gray:{}",
-                    self.crops_dir().join(top_right).to_string_lossy()
-                );
-                let bottom_left = format!(
-                    "gray:{}",
-                    self.crops_dir().join(bottom_left).to_string_lossy()
-                );
-                let bottom_right = format!(
-                    "gray:{}",
-                    self.crops_dir().join(bottom_right).to_string_lossy()
-                );
+                let right_crop_size = (1, ELEVATION_CROP_SIZE);
+                let right_crop_offset = (0, 0);
+                let below_crop_size = (ELEVATION_CROP_SIZE, 1);
+                let below_crop_offset = (0, below_offset_y);
+                let below_right_crop_size = (1, 1);
+                let below_right_crop_offset = (0, below_offset_y);
 
-                let top_right_crop = format!("1x{}+0+0", ELEVATION_TILE_SIZE);
-                let bottom_left_crop = format!("{}x1+0+0", ELEVATION_TILE_SIZE);
-                let bottom_right_crop = format!("1x1+0+0");
+                let (min, max) = Convert::new()
+                    .group(|convert| {
+                        // Top row
+                        convert
+                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(main_crop))
+                            .group(|convert| {
+                                // Crop only the top-right
+                                convert
+                                    .grayscale_input(
+                                        elevation_crop_size,
+                                        &temp_crop_dir.join(right_crop),
+                                    )
+                                    .crop_one(right_crop_size, right_crop_offset)
+                            })
+                            .append_horizontally()
+                    })
+                    .group(|convert| {
+                        // Bottom row
+                        convert
+                            .group(|convert| {
+                                // Crop only the bottom-left
+                                convert
+                                    .grayscale_input(
+                                        elevation_crop_size,
+                                        &temp_crop_dir.join(below_crop),
+                                    )
+                                    .crop_one(below_crop_size, below_crop_offset)
+                            })
+                            .group(|convert| {
+                                // Crop only the bottom-right
+                                convert
+                                    .grayscale_input(
+                                        elevation_crop_size,
+                                        &temp_crop_dir.join(below_right_crop),
+                                    )
+                                    .crop_one(below_right_crop_size, below_right_crop_offset)
+                            })
+                            .append_horizontally()
+                    })
+                    .append_vertically()
+                    .report_max_min()
+                    .output(&self.tiles_dir().join(&tile))
+                    .run_with_max_min()?;
 
-                let out_tile = format!("{}_{}_{}.elevation", level, tile_x, tile_y);
-                let out_tile =
-                    format!("gray:{}", self.tiles_dir().join(out_tile).to_string_lossy());
-
-                let top_left = ["(", &top_left, ")"];
-                let top_right = ["(", &top_right, "-crop", &top_right_crop, ")"];
-                let bottom_left = [
-                    "(",
-                    &bottom_left,
-                    "-gravity",
-                    gravity_below,
-                    "-crop",
-                    &bottom_left_crop,
-                    ")",
-                ];
-                let bottom_right = [
-                    "(",
-                    &bottom_right,
-                    "-gravity",
-                    gravity_below,
-                    "-crop",
-                    &bottom_right_crop,
-                    ")",
-                ];
-
-                let output = Command::new("convert")
-                    .args(&["-depth", "16"])
-                    .args(&["-size", &elevation_crop_size])
-                    .arg("(")
-                    .args(&top_left)
-                    .args(&top_right)
-                    .arg("+append")
-                    .arg(")")
-                    .arg("(")
-                    .args(&bottom_left)
-                    .args(&bottom_right)
-                    .arg("+append")
-                    .arg(")")
-                    .arg("-append")
-                    .args(&["-format", "%[fx:minima] %[fx:maxima]"])
-                    .args(&["-write", "info:-"])
-                    .arg(out_tile)
-                    .stderr(Stdio::inherit())
-                    .output()
-                    .chain_err(|| "Error while running `convert`")?;
-
-                if !output.status.success() {
-                    return Err("`convert` returned with non-zero exit status".into());
-                }
-
-                let output = String::from_utf8(output.stdout).unwrap();
-                let output_parts: Vec<_> = output.split(" ").collect();
-                let min = f32::from_str(output_parts[0]).unwrap();
-                let max = f32::from_str(output_parts[1]).unwrap();
-
-                let min = (min * u16::max_value() as f32) as u16;
-                let max = (max * u16::max_value() as f32) as u16;
-
-                let metadata_path = self.tiles_dir().join(format!(
-                    "{}_{}_{}-first-pass.json",
-                    level,
-                    tile_x,
-                    tile_y
-                ));
-                let mut metadata_file = File::create(metadata_path).chain_err(
-                    || "Unable to create first pass tile metadata file",
-                )?;
+                let min_elevation =
+                    ((min * u16::max_value() as f32) as u16).saturating_sub(ELEVATION_OFFSET);
+                let max_elevation =
+                    ((max * u16::max_value() as f32) as u16).saturating_sub(ELEVATION_OFFSET);
 
                 let metadata = FirstPassTileMetadata {
-                    min_elevation: min.saturating_sub(ELEVATION_OFFSET),
-                    max_elevation: max.saturating_sub(ELEVATION_OFFSET),
+                    min_elevation,
+                    max_elevation,
                 };
 
-                let to_write = serde_json::to_string(&metadata).unwrap();
-                metadata_file.write_all(to_write.as_bytes()).chain_err(
-                    || "Error writing out first pass tile metadata",
-                )?;
+                let metadata_path = format!("{}_{}_{}-first-pass.json", level, x, y);
+                let metadata_file =
+                    File::create(self.tiles_dir().join(&metadata_path))
+                        .chain_err(|| "Error creating first-pass metadata file")?;
+
+                serde_json::to_writer(metadata_file, &metadata)
+                    .chain_err(|| "Error writing out first-pass metadata file")?;
             }
         }
 
         Ok(())
     }
 
-    fn copy_blue_marble_crops(&self) -> Result<()> {
-        if self.tiles_dir().join("0_0_0.jpg").is_file() {
+    fn create_nasa_level(&self, level: u8) -> Result<()> {
+        let test_file = format!("{}_0_0.jpg", level);
+        if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
 
-        self.pretty_log(5, 1, 1, "Copying Blue Marble crops to tiles directory");
+        let tiles_across_width = 2u32.pow(1 + level as u32);
+        let tiles_across_height = 2u32.pow(level as u32);
 
-        for level in 0..MAX_LEVEL + 1 {
-            let num_crops_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
-            let num_crops_across_height = num_crops_across_width / 2;
+        for x in 0..tiles_across_width {
+            for y in 0..tiles_across_height {
+                let tile = format!("{}_{}_{}.jpg", level, x, y);
 
-            for tile_y in 0..num_crops_across_height {
-                for tile_x in 0..num_crops_across_width {
-                    let crop = self.crops_dir().join(format!(
-                        "{}_{}_{}.jpg",
-                        level,
-                        tile_x,
-                        tile_y
-                    ));
-                    let tile = self.tiles_dir().join(format!(
-                        "{}_{}_{}.jpg",
-                        level,
-                        tile_x,
-                        tile_y
-                    ));
+                let top_y = y * 2 + 1;
+                let bottom_y = y * 2;
+                let left_x = x * 2;
+                let right_x = x * 2 + 1;
 
-                    std::fs::copy(crop, tile).chain_err(
-                        || "Error copying Blue Marble crop to tiles directory",
-                    )?;
-                }
+                let top_left = format!("{}_{}_{}.jpg", level + 1, left_x, top_y);
+                let top_right = format!("{}_{}_{}.jpg", level + 1, right_x, top_y);
+                let bottom_left = format!("{}_{}_{}.jpg", level + 1, left_x, bottom_y);
+                let bottom_right = format!("{}_{}_{}.jpg", level + 1, right_x, bottom_y);
+
+                Convert::new()
+                    .group(|convert| {
+                        convert
+                            .input(&self.tiles_dir().join(top_left))
+                            .input(&self.tiles_dir().join(top_right))
+                            .append_horizontally()
+                    })
+                    .group(|convert| {
+                        convert
+                            .input(&self.tiles_dir().join(bottom_left))
+                            .input(&self.tiles_dir().join(bottom_right))
+                            .append_horizontally()
+                    })
+                    .append_vertically()
+                    .resize("50%")
+                    .output(&self.tiles_dir().join(tile))
+                    .run()?;
             }
         }
 
@@ -608,19 +587,29 @@ impl PrepareAssetsTask {
     }
 
     fn create_polygon_data(&self) -> Result<()> {
+        if self.output_dir.join("polygons.json").exists() {
+            return Ok(());
+        }
+
         let mut features_file = File::open(&self.features_file).chain_err(
             || "Could not open features file",
         )?;
+
         let mut geojson = String::new();
         features_file.read_to_string(&mut geojson).chain_err(
-            || "Could not read from features file",
+            || "Could not read features file to string",
         )?;
 
-        let geojson: GeoJson = geojson.parse().unwrap();
+        let geojson: GeoJson = geojson.parse().chain_err(
+            || "Error parsing features file as GeoJson",
+        )?;
+
         let feature_collection = match geojson {
-            GeoJson::FeatureCollection(fc) => fc,
-            _ => panic!("Unexpected geojson object type!"),
-        };
+            GeoJson::FeatureCollection(fc) => Ok(fc),
+            _ => Err(
+                "Features file was not a GeoJson FeatureCollection at the top level",
+            ),
+        }?;
 
         let mut polygons = Vec::new();
         let mut polygon_properties = Vec::new();
@@ -629,102 +618,82 @@ impl PrepareAssetsTask {
             let properties = feature.properties.unwrap_or(serde_json::Map::new());
             let geometry: geo::Geometry<f32> = feature.geometry.unwrap().value.try_into().unwrap();
 
-            match geometry {
-                geo::Geometry::MultiPolygon(mp) => {
-                    for polygon in mp {
-                        polygons.push(polygon);
-                        polygon_properties.push(properties.clone());
-                    }
-                }
-                geo::Geometry::Polygon(p) => {
-                    polygons.push(p);
-                    polygon_properties.push(properties);
-                }
-                _ => panic!(),
-            }
+            let feature_polygons = match geometry {
+                geo::Geometry::Polygon(polygon) => vec![polygon],
+                geo::Geometry::MultiPolygon(multi_polygon) => multi_polygon.0,
+                _ => panic!("Feature file contained something other than Polygon and MultiPolygon"),
+            };
+
+            polygon_properties.extend_from_slice(&vec![properties.clone(); feature_polygons.len()]);
+            polygons.extend_from_slice(&feature_polygons);
         }
 
-        self.create_final_tile_metadatas(&polygons)?;
-        self.create_polygon_file(&polygons, &polygon_properties)?;
+        self.create_final_metadata(&polygons)?;
+        self.create_polygon_file(polygons, polygon_properties)?;
+
         Ok(())
     }
 
-    fn create_final_tile_metadatas(&self, polygons: &[geo::Polygon<f32>]) -> Result<()> {
+    fn create_final_metadata(&self, polygons: &[geo::Polygon<f32>]) -> Result<()> {
+        for level in 0..MAX_LEVEL + 1 {
+            self.create_final_metadata_level(polygons, level)?;
+        }
+
+        Ok(())
+    }
+
+    fn create_final_metadata_level(&self, polygons: &[geo::Polygon<f32>], level: u8) -> Result<()> {
         if self.tiles_dir().join("0_0_0.json").is_file() {
             return Ok(());
         }
 
-        let mut tile_metadatas: BTreeMap<(u32, u32, u32), Vec<u64>> = BTreeMap::new();
-        self.pretty_log(6, 1, 1, "Generating tile metadata files");
+        let tiles_across_width = 2u32.pow(1 + level as u32);
+        let tiles_across_height = 2u32.pow(level as u32);
 
-        for level in 0..MAX_LEVEL + 1 {
-            let num_tiles_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
-            let num_tiles_across_height = num_tiles_across_width / 2;
+        let mut metadatas = BTreeMap::new();
 
-            for (polygon_index, polygon) in polygons.iter().enumerate() {
-                let polygon_bbox = polygon.exterior.bbox().unwrap();
-                let x_min = (polygon_bbox.xmin + 180.0) / 360.0;
-                let x_max = (polygon_bbox.xmax + 180.0) / 360.0;
-                let y_min = (-polygon_bbox.ymin + 90.0) / 180.0;
-                let y_max = (-polygon_bbox.ymax + 90.0) / 180.0;
+        for (polygon_index, polygon) in polygons.iter().enumerate() {
+            let bounding_box = polygon.exterior.bbox().unwrap();
+            let x_min = tiles_across_width as f32 * self.map_x_coord(bounding_box.xmin);
+            let x_max = tiles_across_width as f32 * self.map_x_coord(bounding_box.xmax);
+            let y_min = tiles_across_height as f32 * self.map_y_coord(bounding_box.ymin);
+            let y_max = tiles_across_height as f32 * self.map_y_coord(bounding_box.ymax);
 
-                let xs = (x_min * num_tiles_across_width as f32) as u32..
-                    (x_max * num_tiles_across_width as f32) as u32 + 1;
-                let ys = (y_max * num_tiles_across_height as f32) as u32..
-                    (y_min * num_tiles_across_height as f32) as u32 + 1;
-
-                for x in xs {
-                    for y in ys.clone() {
-                        tile_metadatas
-                            .entry((level, x, y))
-                            .or_insert(Vec::new())
-                            .push(polygon_index as u64);
-                    }
+            for x in x_min.floor() as u32..x_max.ceil() as u32 {
+                for y in y_min.floor() as u32..y_max.ceil() as u32 {
+                    metadatas.entry((x, y)).or_insert(Vec::new()).push(
+                        polygon_index as
+                            u64,
+                    );
                 }
             }
         }
 
-        for level in 0..MAX_LEVEL + 1 {
-            let num_tiles_across_width = TILES_ACROSS_WIDTH / 2u32.pow(level);
-            let num_tiles_across_height = num_tiles_across_width / 2;
+        for x in 0..tiles_across_width {
+            for y in 0..tiles_across_height {
+                if let Some(polygon_indices) = metadatas.get(&(x, y)) {
+                    let first_pass_path = format!("{}_{}_{}-first-pass.json", level, x, y);
+                    let first_pass_file =
+                        File::open(self.tiles_dir().join(first_pass_path))
+                            .chain_err(|| "Error opening first-pass metadata file")?;
 
-            for x in 0..num_tiles_across_width {
-                for y in 0..num_tiles_across_height {
-                    let first_pass_metadata_path = self.tiles_dir().join(format!(
-                        "{}_{}_{}-first-pass.json",
-                        level,
-                        x,
-                        y
-                    ));
-                    let first_pass_metadata_file =
-                        File::open(&first_pass_metadata_path).chain_err(
-                            || "Unable to read in first pass metadata",
-                        )?;
                     let first_pass_metadata: FirstPassTileMetadata =
-                        serde_json::from_reader(first_pass_metadata_file)
-                            .chain_err(|| "Error parsing first pass metadata")?;
-
-                    let default_polygons = Vec::new();
-                    let polygons = tile_metadatas.get(&(level, x, y)).unwrap_or(
-                        &default_polygons,
-                    );
+                        serde_json::from_reader(first_pass_file).chain_err(
+                            || "Error parsing first-pass metadata",
+                        )?;
 
                     let tile_metadata = TileMetadata {
                         min_elevation: first_pass_metadata.min_elevation,
                         max_elevation: first_pass_metadata.max_elevation,
-                        polygons: polygons.clone(),
+                        polygons: polygon_indices.clone(),
                     };
 
-                    let metadata_path =
-                        self.tiles_dir().join(format!("{}_{}_{}.json", level, x, y));
-                    let mut metadata_file = File::create(metadata_path).chain_err(
-                        || "Unable to open final metadata file",
-                    )?;
+                    let metadata_path = format!("{}_{}_{}.json", level, x, y);
+                    let metadata_file = File::create(self.tiles_dir().join(metadata_path))
+                        .chain_err(|| "Error creating metadata file")?;
 
-                    let to_write = serde_json::to_string(&tile_metadata).unwrap();
-                    metadata_file.write_all(to_write.as_bytes()).chain_err(
-                        || "Error writing out final tile metadata",
-                    )?;
+                    serde_json::to_writer(metadata_file, &tile_metadata)
+                        .chain_err(|| "Error writing out metadata file")?;
                 }
             }
         }
@@ -734,96 +703,73 @@ impl PrepareAssetsTask {
 
     fn create_polygon_file(
         &self,
-        polygons: &[geo::Polygon<f32>],
-        polygon_properties: &[serde_json::Map<String, serde_json::Value>],
+        polygons: Vec<geo::Polygon<f32>>,
+        polygon_properties: Vec<PolygonProperties>,
     ) -> Result<()> {
-        if self.output_dir.join("polygons.json").is_file() {
-            return Ok(());
-        }
-
-        self.pretty_log(7, 1, 1, "Generating polygon point data file");
-
-        let multi_level_polygons = polygons
-            .iter()
+        let polygons: Vec<_> = polygons
+            .into_iter()
             .zip(polygon_properties)
             .map(|(polygon, properties)| {
+                let bounding_box = polygon.bbox().unwrap();
+                let bounding_box = [
+                    (
+                        self.map_x_coord(bounding_box.xmin),
+                        self.map_x_coord(bounding_box.xmax),
+                    ),
+                    (
+                        self.map_y_coord(bounding_box.ymin),
+                        self.map_y_coord(bounding_box.ymax),
+                    ),
+                ];
+
                 let levels = (0..MAX_LEVEL + 1)
                     .map(|level| {
-                        let polygon =
-                            polygon.simplify(&self.simplification_epsilons[level as usize]);
-                        let mut points = Vec::new();
+                        let simplified_polygon =
+                            polygon.simplifyvw(&self.simplification_epsilons[level as usize]);
+                        let interior_points =
+                            simplified_polygon.interiors.into_iter().flat_map(|line| {
+                                line.into_iter().map(|point| {
+                                    (self.map_x_coord(point.x()), self.map_y_coord(point.y()))
+                                })
+                            });
 
-                        points.extend(polygon.exterior.into_iter().map(map_point_to_coords));
-                        for ring in polygon.interiors {
-                            points.extend(ring.into_iter().map(map_point_to_coords));
-                        }
+                        let exterior_points =
+                            simplified_polygon.exterior.into_iter().map(|point| {
+                                (self.map_x_coord(point.x()), self.map_y_coord(point.y()))
+                            });
 
-                        if points.len() > 2 {
-                            points
-                        } else {
-                            vec![]
-                        }
+                        exterior_points.chain(interior_points).collect()
                     })
                     .collect();
 
-                let bbox = polygon.bbox().unwrap();
-
                 MultiLevelPolygon {
-                    bounding_box: [
-                        (map_x_to_coords(bbox.xmin), map_x_to_coords(bbox.xmax)),
-                        (map_y_to_coords(bbox.ymax), map_y_to_coords(bbox.ymin)),
-                    ],
-                    properties: properties.clone(),
-                    levels: levels,
+                    properties,
+                    bounding_box,
+                    levels,
                 }
             })
             .collect();
 
-        let polygon_path = self.output_dir.join("polygons.json");
-        let mut polygon_file = File::create(polygon_path).chain_err(
-            || "Unable to open polygons file",
-        )?;
+        let polygon_point_data = PolygonPointData { polygons };
 
-        let polygon_point_data = PolygonPointData { polygons: multi_level_polygons };
+        let polygon_file = File::create(self.output_dir.join("polygons.json"))
+            .chain_err(|| "Error creating polygon point data file")?;
 
-        let to_write = serde_json::to_string(&polygon_point_data).unwrap();
-        polygon_file.write_all(to_write.as_bytes()).chain_err(
-            || "Error writing out polygon point data",
-        )?;
+        serde_json::to_writer(polygon_file, &polygon_point_data)
+            .chain_err(|| "Error writing out metadata file")?;
 
         Ok(())
     }
 
-    fn pretty_log(&self, step: u32, sub_step: u32, num_sub_steps: u32, message: &str) {
-        info!(
-            "[{}/{}] [{}/{}]: {}",
-            step,
-            NUM_STEPS,
-            sub_step,
-            num_sub_steps,
-            message
-        );
+    fn map_x_coord(&self, x: f32) -> f32 {
+        (x + 180.0) / 360.0
     }
 
-    fn crops_dir(&self) -> PathBuf {
-        self.output_dir.join("crops")
+    fn map_y_coord(&self, y: f32) -> f32 {
+        (y + 90.0) / 180.0
     }
 
     fn tiles_dir(&self) -> PathBuf {
         self.output_dir.join("tiles")
     }
-}
-
-fn map_point_to_coords(point: geo::Point<f32>) -> (f32, f32) {
-    (map_x_to_coords(point.x()), map_y_to_coords(point.y()))
-}
-
-/// Map [-180, 180] to [0, 2]
-fn map_x_to_coords(x: f32) -> f32 {
-    (x + 180.0) / 180.0
-}
-
-/// Map [-90, 90] to [0, 1]
-fn map_y_to_coords(y: f32) -> f32 {
-    (y + 90.0) / 180.0
 }
