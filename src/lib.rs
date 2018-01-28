@@ -266,7 +266,7 @@ impl PrepareAssetsTask {
     }
 
     fn create_noaa_max_level_crops(&self, temp_crop_dir: &Path) -> Result<()> {
-        let test_file = format!("{}_0_0.elevation", MAX_LEVEL);
+        let test_file = format!("{}_0_0.pgm", MAX_LEVEL);
         if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
@@ -360,28 +360,26 @@ impl PrepareAssetsTask {
             .offset_each_pixel(ELEVATION_OFFSET)
             .append_vertically()
             .resize(&format!("{}", NOAA_TILE_RESIZE_WIDTH))
-            .grayscale_output(&temp_crop_dir.join("out.elevation"))
+            .output(&temp_crop_dir.join("out.pgm"))
             .run()?;
 
         Convert::new()
             .monitor()
-            .grayscale_input(
-                (NOAA_TILE_RESIZE_WIDTH, NOAA_TILE_RESIZE_WIDTH),
-                &temp_crop_dir.join("out.elevation"),
-            )
+            .input(&temp_crop_dir.join("out.pgm"))
             .crops(ELEVATION_CROP_SIZE)
-            .grayscale_output(&temp_crop_dir.join("out.elevation"))
+            .adjoin()
+            .output(&temp_crop_dir.join("out.pgm"))
             .run()?;
 
         for x in 0..CROPS_ACROSS_NOAA_TILE {
             for y in 0..CROPS_ACROSS_NOAA_TILE {
                 let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
                 let crop_filename =
-                    format!("out-{}.elevation", inverted_y * TILES_ACROSS_NASA_TILE + x);
+                    format!("out-{}.pgm", inverted_y * TILES_ACROSS_NASA_TILE + x);
                 let crop_path = temp_crop_dir.join(crop_filename);
 
                 let out_crop_filename =
-                    format!("{}_{}_{}.elevation", MAX_LEVEL, x_offset + x, y_offset + y);
+                    format!("{}_{}_{}.pgm", MAX_LEVEL, x_offset + x, y_offset + y);
                 let out_crop_path = temp_crop_dir.join(out_crop_filename);
 
                 fs::copy(crop_path, out_crop_path).chain_err(
@@ -394,7 +392,7 @@ impl PrepareAssetsTask {
     }
 
     fn create_noaa_crop_level(&self, temp_crop_dir: &Path, level: u8) -> Result<()> {
-        let test_file = format!("{}_0_0.elevation", level);
+        let test_file = format!("{}_0_0.pgm", level);
         if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
@@ -402,33 +400,31 @@ impl PrepareAssetsTask {
         let tiles_across_width = 2u32.pow(1 + level as u32);
         let tiles_across_height = 2u32.pow(level as u32);
 
-        let elevation_crop_size = (ELEVATION_CROP_SIZE, ELEVATION_CROP_SIZE);
-
         for x in 0..tiles_across_width {
             for y in 0..tiles_across_height {
-                let crop = format!("{}_{}_{}.elevation", level, x, y);
+                let crop = format!("{}_{}_{}.pgm", level, x, y);
 
                 let top_y = y * 2 + 1;
                 let bottom_y = y * 2;
                 let left_x = x * 2;
                 let right_x = x * 2 + 1;
 
-                let top_left = format!("{}_{}_{}.elevation", level + 1, left_x, top_y);
-                let top_right = format!("{}_{}_{}.elevation", level + 1, right_x, top_y);
-                let bottom_left = format!("{}_{}_{}.elevation", level + 1, left_x, bottom_y);
-                let bottom_right = format!("{}_{}_{}.elevation", level + 1, right_x, bottom_y);
+                let top_left = format!("{}_{}_{}.pgm", level + 1, left_x, top_y);
+                let top_right = format!("{}_{}_{}.pgm", level + 1, right_x, top_y);
+                let bottom_left = format!("{}_{}_{}.pgm", level + 1, left_x, bottom_y);
+                let bottom_right = format!("{}_{}_{}.pgm", level + 1, right_x, bottom_y);
 
                 Convert::new()
                     .group(|convert| {
                         convert
-                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(top_left))
-                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(top_right))
+                            .input(&temp_crop_dir.join(top_left))
+                            .input(&temp_crop_dir.join(top_right))
                             .append_horizontally()
                     })
                     .group(|convert| {
                         convert
-                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(bottom_left))
-                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(bottom_right))
+                            .input(&temp_crop_dir.join(bottom_left))
+                            .input(&temp_crop_dir.join(bottom_right))
                             .append_horizontally()
                     })
                     .append_vertically()
@@ -442,19 +438,17 @@ impl PrepareAssetsTask {
     }
 
     fn create_noaa_level(&self, temp_crop_dir: &Path, level: u8) -> Result<()> {
-        let test_file = format!("{}_0_0.elevation", level);
+        let test_file = format!("{}_0_0.pgm", level);
         if self.tiles_dir().join(test_file).exists() {
             return Ok(());
         }
-
-        let elevation_crop_size = (ELEVATION_CROP_SIZE, ELEVATION_CROP_SIZE);
 
         let tiles_across_width = 2u32.pow(1 + level as u32);
         let tiles_across_height = 2u32.pow(level as u32);
 
         for x in 0..tiles_across_width {
             for y in 0..tiles_across_height {
-                let tile = format!("{}_{}_{}.elevation", level, x, y);
+                let tile = format!("{}_{}_{}.pgm", level, x, y);
 
                 // copy from bottom and right -- if you're on the bottom row, use your own bottom
                 // row as your "beneath's top row".
@@ -470,10 +464,10 @@ impl PrepareAssetsTask {
                     x + 1
                 };
 
-                let main_crop = format!("{}_{}_{}.elevation", level, x, y);
-                let right_crop = format!("{}_{}_{}.elevation", level, right_x, y);
-                let below_crop = format!("{}_{}_{}.elevation", level, x, below_y);
-                let below_right_crop = format!("{}_{}_{}.elevation", level, right_x, below_y);
+                let main_crop = format!("{}_{}_{}.pgm", level, x, y);
+                let right_crop = format!("{}_{}_{}.pgm", level, right_x, y);
+                let below_crop = format!("{}_{}_{}.pgm", level, x, below_y);
+                let below_right_crop = format!("{}_{}_{}.pgm", level, right_x, below_y);
 
                 let right_crop_size = (1, ELEVATION_CROP_SIZE);
                 let right_crop_offset = (0, 0);
@@ -486,15 +480,12 @@ impl PrepareAssetsTask {
                     .group(|convert| {
                         // Top row
                         convert
-                            .grayscale_input(elevation_crop_size, &temp_crop_dir.join(main_crop))
+                            .input(&temp_crop_dir.join(main_crop))
                             .group(|convert| {
-                                // Crop only the top-right
                                 convert
-                                    .grayscale_input(
-                                        elevation_crop_size,
-                                        &temp_crop_dir.join(right_crop),
-                                    )
+                                    .input(&temp_crop_dir.join(right_crop))
                                     .crop_one(right_crop_size, right_crop_offset)
+
                             })
                             .append_horizontally()
                     })
@@ -502,21 +493,13 @@ impl PrepareAssetsTask {
                         // Bottom row
                         convert
                             .group(|convert| {
-                                // Crop only the bottom-left
                                 convert
-                                    .grayscale_input(
-                                        elevation_crop_size,
-                                        &temp_crop_dir.join(below_crop),
-                                    )
+                                    .input(&temp_crop_dir.join(below_crop))
                                     .crop_one(below_crop_size, below_crop_offset)
                             })
                             .group(|convert| {
-                                // Crop only the bottom-right
                                 convert
-                                    .grayscale_input(
-                                        elevation_crop_size,
-                                        &temp_crop_dir.join(below_right_crop),
-                                    )
+                                    .input(&temp_crop_dir.join(below_right_crop))
                                     .crop_one(below_right_crop_size, below_right_crop_offset)
                             })
                             .append_horizontally()

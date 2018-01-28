@@ -34,10 +34,8 @@ impl Convert {
         self
     }
 
-    pub fn grayscale_output(&mut self, path: &Path) -> &mut Convert {
+    pub fn adjoin(&mut self) -> &mut Convert {
         self.command.arg("+adjoin");
-        self.command.args(&["-depth", "16"]);
-        self.command.arg(format!("gray:{}", path.to_string_lossy()));
         self
     }
 
