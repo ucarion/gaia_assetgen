@@ -357,16 +357,25 @@ impl PrepareAssetsTask {
                 (10800, bottom_height),
                 &self.noaa_globe_dir.join(bottom_tile),
             )
-            .append_vertically()
             .offset_each_pixel(ELEVATION_OFFSET)
+            .append_vertically()
             .resize(&format!("{}", NOAA_TILE_RESIZE_WIDTH))
+            .grayscale_output(&temp_crop_dir.join("out.elevation"))
+            .run()?;
+
+        Convert::new()
+            .monitor()
+            .grayscale_input(
+                (NOAA_TILE_RESIZE_WIDTH, NOAA_TILE_RESIZE_WIDTH),
+                &temp_crop_dir.join("out.elevation"),
+            )
             .crops(ELEVATION_CROP_SIZE)
             .grayscale_output(&temp_crop_dir.join("out.elevation"))
             .run()?;
 
         for x in 0..CROPS_ACROSS_NOAA_TILE {
             for y in 0..CROPS_ACROSS_NOAA_TILE {
-                let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
+u               let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
                 let crop_filename =
                     format!("out-{}.elevation", inverted_y * TILES_ACROSS_NASA_TILE + x);
                 let crop_path = temp_crop_dir.join(crop_filename);
@@ -528,12 +537,12 @@ impl PrepareAssetsTask {
                 };
 
                 let metadata_path = format!("{}_{}_{}-first-pass.json", level, x, y);
-                let metadata_file =
-                    File::create(self.tiles_dir().join(&metadata_path))
-                        .chain_err(|| "Error creating first-pass metadata file")?;
+                let metadata_file = File::create(self.tiles_dir().join(&metadata_path))
+                    .chain_err(|| "Error creating first-pass metadata file")?;
 
-                serde_json::to_writer(metadata_file, &metadata)
-                    .chain_err(|| "Error writing out first-pass metadata file")?;
+                serde_json::to_writer(metadata_file, &metadata).chain_err(
+                    || "Error writing out first-pass metadata file",
+                )?;
             }
         }
 
