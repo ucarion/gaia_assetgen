@@ -375,7 +375,7 @@ impl PrepareAssetsTask {
 
         for x in 0..CROPS_ACROSS_NOAA_TILE {
             for y in 0..CROPS_ACROSS_NOAA_TILE {
-u               let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
+                let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
                 let crop_filename =
                     format!("out-{}.elevation", inverted_y * TILES_ACROSS_NASA_TILE + x);
                 let crop_path = temp_crop_dir.join(crop_filename);
