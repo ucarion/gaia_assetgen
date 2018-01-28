@@ -652,14 +652,16 @@ impl PrepareAssetsTask {
     }
 
     fn create_final_metadata_level(&self, polygons: &[geo::Polygon<f32>], level: u8) -> Result<()> {
-        if self.tiles_dir().join("0_0_0.json").is_file() {
-            return Ok(());
-        }
-
         let tiles_across_width = 2u32.pow(1 + level as u32);
         let tiles_across_height = 2u32.pow(level as u32);
 
         let mut metadatas = BTreeMap::new();
+
+        for x in 0..tiles_across_width {
+            for y in 0..tiles_across_height {
+                metadatas.insert((x, y), Vec::new());
+            }
+        }
 
         for (polygon_index, polygon) in polygons.iter().enumerate() {
             let bounding_box = polygon.exterior.bbox().unwrap();
@@ -670,10 +672,8 @@ impl PrepareAssetsTask {
 
             for x in x_min.floor() as u32..x_max.ceil() as u32 {
                 for y in y_min.floor() as u32..y_max.ceil() as u32 {
-                    metadatas.entry((x, y)).or_insert(Vec::new()).push(
-                        polygon_index as
-                            u64,
-                    );
+                    let polygon_indices = metadatas.entry((x, y)).or_insert(Vec::new());
+                    polygon_indices.push(polygon_index as u64);
                 }
             }
         }
