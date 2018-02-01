@@ -374,8 +374,7 @@ impl PrepareAssetsTask {
         for x in 0..CROPS_ACROSS_NOAA_TILE {
             for y in 0..CROPS_ACROSS_NOAA_TILE {
                 let inverted_y = CROPS_ACROSS_NOAA_TILE - 1 - y;
-                let crop_filename =
-                    format!("out-{}.pgm", inverted_y * TILES_ACROSS_NASA_TILE + x);
+                let crop_filename = format!("out-{}.pgm", inverted_y * TILES_ACROSS_NASA_TILE + x);
                 let crop_path = temp_crop_dir.join(crop_filename);
 
                 let out_crop_filename =
@@ -449,6 +448,7 @@ impl PrepareAssetsTask {
         for x in 0..tiles_across_width {
             for y in 0..tiles_across_height {
                 let tile = format!("{}_{}_{}.pgm", level, x, y);
+                let gray_tile = format!("{}_{}_{}.gray", level, x, y);
 
                 // copy from bottom and right -- if you're on the bottom row, use your own bottom
                 // row as your "beneath's top row".
@@ -482,9 +482,10 @@ impl PrepareAssetsTask {
                         convert
                             .input(&temp_crop_dir.join(main_crop))
                             .group(|convert| {
-                                convert
-                                    .input(&temp_crop_dir.join(right_crop))
-                                    .crop_one(right_crop_size, right_crop_offset)
+                                convert.input(&temp_crop_dir.join(right_crop)).crop_one(
+                                    right_crop_size,
+                                    right_crop_offset,
+                                )
 
                             })
                             .append_horizontally()
@@ -493,9 +494,10 @@ impl PrepareAssetsTask {
                         // Bottom row
                         convert
                             .group(|convert| {
-                                convert
-                                    .input(&temp_crop_dir.join(below_crop))
-                                    .crop_one(below_crop_size, below_crop_offset)
+                                convert.input(&temp_crop_dir.join(below_crop)).crop_one(
+                                    below_crop_size,
+                                    below_crop_offset,
+                                )
                             })
                             .group(|convert| {
                                 convert
@@ -526,6 +528,12 @@ impl PrepareAssetsTask {
                 serde_json::to_writer(metadata_file, &metadata).chain_err(
                     || "Error writing out first-pass metadata file",
                 )?;
+
+                Convert::new()
+                    .input(&self.tiles_dir().join(&tile))
+                    .depth(16)
+                    .output(&self.tiles_dir().join(&gray_tile))
+                    .run()?;
             }
         }
 

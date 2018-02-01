@@ -44,6 +44,11 @@ impl Convert {
         self
     }
 
+    pub fn depth(&mut self, depth: u8) -> &mut Convert {
+        self.command.args(&["-depth", &format!("{}", depth)]);
+        self
+    }
+
     pub fn group<F>(&mut self, f: F) -> &mut Convert
     where
         F: FnOnce(&mut Convert) -> &mut Convert,
