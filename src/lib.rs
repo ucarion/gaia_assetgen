@@ -69,7 +69,7 @@ struct FirstPassTileMetadata {
     max_elevation: u16,
 }
 
-pub type PolygonProperties = serde_json::Map<String, serde_json::Value>;
+pub type Properties = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TileMetadata {
@@ -79,17 +79,24 @@ pub struct TileMetadata {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct PolygonPointData {
+pub struct VectorData {
     pub polygons: Vec<MultiLevelPolygon>,
+    pub points: Vec<PointWithElevation>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MultiLevelPolygon {
-    pub properties: PolygonProperties,
+    pub properties: Properties,
     /// `(min, max)` along x- and y-axis
     pub bounding_box: [(f32, f32); 2],
     /// The same polygon simplified according to epsilons in `simplification_epsilons`.
     pub levels: Vec<Vec<(f32, f32)>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PointWithElevation {
+    pub properties: Properties,
+    pub coordinates: [f32; 3],
 }
 
 #[derive(Debug)]
@@ -152,9 +159,7 @@ impl PrepareAssetsTask {
 
     pub fn run(&self) -> Result<()> {
         if !self.tiles_dir().is_dir() {
-            fs::create_dir(&self.tiles_dir()).chain_err(
-                || "Could not create tiles directory",
-            )?;
+            fs::create_dir(&self.tiles_dir()).chain_err(|| "Could not create tiles directory")?;
         }
 
         self.create_nasa_max_level_tiles()?;
@@ -162,9 +167,8 @@ impl PrepareAssetsTask {
             self.create_nasa_level(level)?;
         }
 
-        let temp_crop_dir = TempDir::new(&format!("crops")).chain_err(
-            || "Error creating temporary dir",
-        )?;
+        let temp_crop_dir =
+            TempDir::new(&format!("crops")).chain_err(|| "Error creating temporary dir")?;
 
         self.create_noaa_max_level_crops(&temp_crop_dir.path())?;
         self.create_noaa_level(&temp_crop_dir.path(), MAX_LEVEL)?;
@@ -184,46 +188,14 @@ impl PrepareAssetsTask {
             return Ok(());
         }
 
-        self.create_nasa_max_level_tile(
-            "A1",
-            TILES_ACROSS_NASA_TILE * 0,
-            TILES_ACROSS_NASA_TILE,
-        )?;
-        self.create_nasa_max_level_tile(
-            "A2",
-            TILES_ACROSS_NASA_TILE * 0,
-            0,
-        )?;
-        self.create_nasa_max_level_tile(
-            "B1",
-            TILES_ACROSS_NASA_TILE * 1,
-            TILES_ACROSS_NASA_TILE,
-        )?;
-        self.create_nasa_max_level_tile(
-            "B2",
-            TILES_ACROSS_NASA_TILE * 1,
-            0,
-        )?;
-        self.create_nasa_max_level_tile(
-            "C1",
-            TILES_ACROSS_NASA_TILE * 2,
-            TILES_ACROSS_NASA_TILE,
-        )?;
-        self.create_nasa_max_level_tile(
-            "C2",
-            TILES_ACROSS_NASA_TILE * 2,
-            0,
-        )?;
-        self.create_nasa_max_level_tile(
-            "D1",
-            TILES_ACROSS_NASA_TILE * 3,
-            TILES_ACROSS_NASA_TILE,
-        )?;
-        self.create_nasa_max_level_tile(
-            "D2",
-            TILES_ACROSS_NASA_TILE * 3,
-            0,
-        )?;
+        self.create_nasa_max_level_tile("A1", TILES_ACROSS_NASA_TILE * 0, TILES_ACROSS_NASA_TILE)?;
+        self.create_nasa_max_level_tile("A2", TILES_ACROSS_NASA_TILE * 0, 0)?;
+        self.create_nasa_max_level_tile("B1", TILES_ACROSS_NASA_TILE * 1, TILES_ACROSS_NASA_TILE)?;
+        self.create_nasa_max_level_tile("B2", TILES_ACROSS_NASA_TILE * 1, 0)?;
+        self.create_nasa_max_level_tile("C1", TILES_ACROSS_NASA_TILE * 2, TILES_ACROSS_NASA_TILE)?;
+        self.create_nasa_max_level_tile("C2", TILES_ACROSS_NASA_TILE * 2, 0)?;
+        self.create_nasa_max_level_tile("D1", TILES_ACROSS_NASA_TILE * 3, TILES_ACROSS_NASA_TILE)?;
+        self.create_nasa_max_level_tile("D2", TILES_ACROSS_NASA_TILE * 3, 0)?;
 
         Ok(())
     }
@@ -234,9 +206,8 @@ impl PrepareAssetsTask {
         x_offset: u32,
         y_offset: u32,
     ) -> Result<()> {
-        let temp_dir = TempDir::new(&format!("nasa_{}", nasa_tile)).chain_err(
-            || "Error creating temporary dir",
-        )?;
+        let temp_dir = TempDir::new(&format!("nasa_{}", nasa_tile))
+            .chain_err(|| "Error creating temporary dir")?;
 
         let file_name = format!("world.topo.bathy.200412.3x21600x21600.{}.jpg", nasa_tile);
 
@@ -256,9 +227,7 @@ impl PrepareAssetsTask {
                 let tile_filename = format!("{}_{}_{}.jpg", MAX_LEVEL, x_offset + x, y_offset + y);
                 let tile_path = self.tiles_dir().join(tile_filename);
 
-                fs::copy(crop_path, tile_path).chain_err(
-                    || "Error copying NASA tile crop",
-                )?;
+                fs::copy(crop_path, tile_path).chain_err(|| "Error copying NASA tile crop")?;
             }
         }
 
@@ -381,9 +350,7 @@ impl PrepareAssetsTask {
                     format!("{}_{}_{}.pgm", MAX_LEVEL, x_offset + x, y_offset + y);
                 let out_crop_path = temp_crop_dir.join(out_crop_filename);
 
-                fs::copy(crop_path, out_crop_path).chain_err(
-                    || "Error copying NASA tile crop",
-                )?;
+                fs::copy(crop_path, out_crop_path).chain_err(|| "Error copying NASA tile crop")?;
             }
         }
 
@@ -482,11 +449,9 @@ impl PrepareAssetsTask {
                         convert
                             .input(&temp_crop_dir.join(main_crop))
                             .group(|convert| {
-                                convert.input(&temp_crop_dir.join(right_crop)).crop_one(
-                                    right_crop_size,
-                                    right_crop_offset,
-                                )
-
+                                convert
+                                    .input(&temp_crop_dir.join(right_crop))
+                                    .crop_one(right_crop_size, right_crop_offset)
                             })
                             .append_horizontally()
                     })
@@ -494,10 +459,9 @@ impl PrepareAssetsTask {
                         // Bottom row
                         convert
                             .group(|convert| {
-                                convert.input(&temp_crop_dir.join(below_crop)).crop_one(
-                                    below_crop_size,
-                                    below_crop_offset,
-                                )
+                                convert
+                                    .input(&temp_crop_dir.join(below_crop))
+                                    .crop_one(below_crop_size, below_crop_offset)
                             })
                             .group(|convert| {
                                 convert
@@ -525,9 +489,8 @@ impl PrepareAssetsTask {
                 let metadata_file = File::create(self.tiles_dir().join(&metadata_path))
                     .chain_err(|| "Error creating first-pass metadata file")?;
 
-                serde_json::to_writer(metadata_file, &metadata).chain_err(
-                    || "Error writing out first-pass metadata file",
-                )?;
+                serde_json::to_writer(metadata_file, &metadata)
+                    .chain_err(|| "Error writing out first-pass metadata file")?;
 
                 Convert::new()
                     .input(&self.tiles_dir().join(&tile))
@@ -591,24 +554,21 @@ impl PrepareAssetsTask {
             return Ok(());
         }
 
-        let mut features_file = File::open(&self.features_file).chain_err(
-            || "Could not open features file",
-        )?;
+        let mut features_file =
+            File::open(&self.features_file).chain_err(|| "Could not open features file")?;
 
         let mut geojson = String::new();
-        features_file.read_to_string(&mut geojson).chain_err(
-            || "Could not read features file to string",
-        )?;
+        features_file
+            .read_to_string(&mut geojson)
+            .chain_err(|| "Could not read features file to string")?;
 
-        let geojson: GeoJson = geojson.parse().chain_err(
-            || "Error parsing features file as GeoJson",
-        )?;
+        let geojson: GeoJson = geojson
+            .parse()
+            .chain_err(|| "Error parsing features file as GeoJson")?;
 
         let feature_collection = match geojson {
             GeoJson::FeatureCollection(fc) => Ok(fc),
-            _ => Err(
-                "Features file was not a GeoJson FeatureCollection at the top level",
-            ),
+            _ => Err("Features file was not a GeoJson FeatureCollection at the top level"),
         }?;
 
         let mut polygons = Vec::new();
@@ -673,14 +633,12 @@ impl PrepareAssetsTask {
             for y in 0..tiles_across_height {
                 if let Some(polygon_indices) = metadatas.get(&(x, y)) {
                     let first_pass_path = format!("{}_{}_{}-first-pass.json", level, x, y);
-                    let first_pass_file =
-                        File::open(self.tiles_dir().join(first_pass_path))
-                            .chain_err(|| "Error opening first-pass metadata file")?;
+                    let first_pass_file = File::open(self.tiles_dir().join(first_pass_path))
+                        .chain_err(|| "Error opening first-pass metadata file")?;
 
                     let first_pass_metadata: FirstPassTileMetadata =
-                        serde_json::from_reader(first_pass_file).chain_err(
-                            || "Error parsing first-pass metadata",
-                        )?;
+                        serde_json::from_reader(first_pass_file)
+                            .chain_err(|| "Error parsing first-pass metadata")?;
 
                     let tile_metadata = TileMetadata {
                         min_elevation: first_pass_metadata.min_elevation,
@@ -704,7 +662,7 @@ impl PrepareAssetsTask {
     fn create_polygon_file(
         &self,
         polygons: Vec<geo::Polygon<f32>>,
-        polygon_properties: Vec<PolygonProperties>,
+        polygon_properties: Vec<Properties>,
     ) -> Result<()> {
         let polygons: Vec<_> = polygons
             .into_iter()
@@ -733,10 +691,9 @@ impl PrepareAssetsTask {
                                 })
                             });
 
-                        let exterior_points =
-                            simplified_polygon.exterior.into_iter().map(|point| {
-                                (self.map_x_coord(point.x()), self.map_y_coord(point.y()))
-                            });
+                        let exterior_points = simplified_polygon.exterior.into_iter().map(
+                            |point| (self.map_x_coord(point.x()), self.map_y_coord(point.y())),
+                        );
 
                         exterior_points.chain(interior_points).collect()
                     })
@@ -750,7 +707,10 @@ impl PrepareAssetsTask {
             })
             .collect();
 
-        let polygon_point_data = PolygonPointData { polygons };
+        let polygon_point_data = VectorData {
+            polygons,
+            points: vec![],
+        };
 
         let polygon_file = File::create(self.output_dir.join("polygons.json"))
             .chain_err(|| "Error creating polygon point data file")?;

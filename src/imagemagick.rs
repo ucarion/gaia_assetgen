@@ -89,27 +89,21 @@ impl Convert {
     }
 
     pub fn offset_each_pixel(&mut self, offset: u16) -> &mut Convert {
-        self.command.args(
-            &[
-                "-evaluate",
-                "addmodulus",
-                &offset.to_string(),
-            ],
-        );
+        self.command
+            .args(&["-evaluate", "addmodulus", &offset.to_string()]);
         self
     }
 
     pub fn report_max_min(&mut self) -> &mut Convert {
-        self.command.args(
-            &["-format", "%[fx:minima] %[fx:maxima]", "-write", "info:-"],
-        );
+        self.command
+            .args(&["-format", "%[fx:minima] %[fx:maxima]", "-write", "info:-"]);
         self
     }
 
     pub fn run(&mut self) -> Result<String> {
-        let output = self.command.output().chain_err(
-            || "Error when running `convert`",
-        )?;
+        let output = self.command
+            .output()
+            .chain_err(|| "Error when running `convert`")?;
 
         if !output.status.success() {
             return Err("`convert` returned with non-zero exit status".into());
