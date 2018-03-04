@@ -76,12 +76,13 @@ pub struct TileMetadata {
     pub min_elevation: u16,
     pub max_elevation: u16,
     pub polygons: Vec<u64>,
+    pub points: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct VectorData {
+pub struct FeaturesData {
     pub polygons: Vec<MultiLevelPolygon>,
-    pub points: Vec<PointWithElevation>,
+    pub points: Vec<MultiLevelPoint>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -94,16 +95,18 @@ pub struct MultiLevelPolygon {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct PointWithElevation {
+pub struct MultiLevelPoint {
     pub properties: Properties,
-    pub coordinates: [f32; 3],
+    pub coordinates: [f32; 2],
+    pub levels: Vec<f32>,
 }
 
 #[derive(Debug)]
 pub struct PrepareAssetsTask {
     noaa_globe_dir: PathBuf,
     nasa_blue_marble_dir: PathBuf,
-    features_file: PathBuf,
+    polygons_file: PathBuf,
+    points_file: PathBuf,
     simplification_epsilons: [f32; MAX_LEVEL as usize + 1],
     output_dir: PathBuf,
 }
@@ -113,7 +116,8 @@ impl PrepareAssetsTask {
         PrepareAssetsTask {
             noaa_globe_dir: "".into(),
             nasa_blue_marble_dir: "".into(),
-            features_file: "".into(),
+            polygons_file: "".into(),
+            points_file: "".into(),
             simplification_epsilons: [0.0; MAX_LEVEL as usize + 1],
             output_dir: "".into(),
         }
@@ -121,30 +125,34 @@ impl PrepareAssetsTask {
 
     pub fn with_noaa_globe_dir(self, noaa_globe_dir: PathBuf) -> PrepareAssetsTask {
         PrepareAssetsTask {
-            noaa_globe_dir: noaa_globe_dir,
+            noaa_globe_dir,
             ..self
         }
     }
 
     pub fn with_nasa_blue_marble_dir(self, nasa_blue_marble_dir: PathBuf) -> PrepareAssetsTask {
         PrepareAssetsTask {
-            nasa_blue_marble_dir: nasa_blue_marble_dir,
+            nasa_blue_marble_dir,
             ..self
         }
     }
 
-    pub fn with_features_file(self, features_file: PathBuf) -> PrepareAssetsTask {
+    pub fn with_polygons_file(self, polygons_file: PathBuf) -> PrepareAssetsTask {
         PrepareAssetsTask {
-            features_file: features_file,
+            polygons_file,
+            ..self
+        }
+    }
+
+    pub fn with_points_file(self, points_file: PathBuf) -> PrepareAssetsTask {
+        PrepareAssetsTask {
+            points_file,
             ..self
         }
     }
 
     pub fn with_output_dir(self, output_dir: PathBuf) -> PrepareAssetsTask {
-        PrepareAssetsTask {
-            output_dir: output_dir,
-            ..self
-        }
+        PrepareAssetsTask { output_dir, ..self }
     }
 
     pub fn with_simplification_epsilons(
@@ -152,7 +160,7 @@ impl PrepareAssetsTask {
         simplification_epsilons: [f32; MAX_LEVEL as usize + 1],
     ) -> PrepareAssetsTask {
         PrepareAssetsTask {
-            simplification_epsilons: simplification_epsilons,
+            simplification_epsilons,
             ..self
         }
     }
@@ -550,12 +558,22 @@ impl PrepareAssetsTask {
     }
 
     fn create_polygon_data(&self) -> Result<()> {
-        if self.output_dir.join("polygons.json").exists() {
+        if self.output_dir.join("features.json").exists() {
             return Ok(());
         }
 
+        let (polygons, polygon_properties) = self.load_polygons()?;
+        let (points, point_properties) = self.load_points()?;
+
+        self.create_final_metadata(&polygons, &points)?;
+        self.create_features_file(polygons, polygon_properties, points, point_properties)?;
+
+        Ok(())
+    }
+
+    fn load_polygons(&self) -> Result<(Vec<geo::Polygon<f32>>, Vec<Properties>)> {
         let mut features_file =
-            File::open(&self.features_file).chain_err(|| "Could not open features file")?;
+            File::open(&self.polygons_file).chain_err(|| "Could not open features file")?;
 
         let mut geojson = String::new();
         features_file
@@ -588,29 +606,74 @@ impl PrepareAssetsTask {
             polygons.extend_from_slice(&feature_polygons);
         }
 
-        self.create_final_metadata(&polygons)?;
-        self.create_polygon_file(polygons, polygon_properties)?;
-
-        Ok(())
+        Ok((polygons, polygon_properties))
     }
 
-    fn create_final_metadata(&self, polygons: &[geo::Polygon<f32>]) -> Result<()> {
+    fn load_points(&self) -> Result<(Vec<geo::Point<f32>>, Vec<Properties>)> {
+        let mut points_file =
+            File::open(&self.points_file).chain_err(|| "Could not open points file")?;
+
+        let mut geojson = String::new();
+        points_file
+            .read_to_string(&mut geojson)
+            .chain_err(|| "Could not read points file to string")?;
+
+        let geojson: GeoJson = geojson
+            .parse()
+            .chain_err(|| "Error parsing points file as GeoJson")?;
+
+        let feature_collection = match geojson {
+            GeoJson::FeatureCollection(fc) => Ok(fc),
+            _ => Err("Features file was not a GeoJson FeatureCollection at the top level"),
+        }?;
+
+        let mut points = Vec::new();
+        let mut point_properties = Vec::new();
+
+        for feature in feature_collection.features {
+            let properties = feature.properties.unwrap_or(serde_json::Map::new());
+            let geometry: geo::Geometry<f32> = feature.geometry.unwrap().value.try_into().unwrap();
+
+            let feature_point = match geometry {
+                geo::Geometry::Point(point) => point,
+                _ => panic!("Feature file contained something other than Polygon and MultiPolygon"),
+            };
+
+            points.push(feature_point);
+            point_properties.push(properties);
+        }
+
+        Ok((points, point_properties))
+    }
+
+    fn create_final_metadata(
+        &self,
+        polygons: &[geo::Polygon<f32>],
+        points: &[geo::Point<f32>],
+    ) -> Result<()> {
         for level in 0..MAX_LEVEL + 1 {
-            self.create_final_metadata_level(polygons, level)?;
+            self.create_final_metadata_level(polygons, points, level)?;
         }
 
         Ok(())
     }
 
-    fn create_final_metadata_level(&self, polygons: &[geo::Polygon<f32>], level: u8) -> Result<()> {
+    fn create_final_metadata_level(
+        &self,
+        polygons: &[geo::Polygon<f32>],
+        points: &[geo::Point<f32>],
+        level: u8,
+    ) -> Result<()> {
         let tiles_across_width = 2u32.pow(1 + level as u32);
         let tiles_across_height = 2u32.pow(level as u32);
 
-        let mut metadatas = BTreeMap::new();
+        let mut tile_polygons = BTreeMap::new();
+        let mut tile_points = BTreeMap::new();
 
         for x in 0..tiles_across_width {
             for y in 0..tiles_across_height {
-                metadatas.insert((x, y), Vec::new());
+                tile_polygons.insert((x, y), Vec::new());
+                tile_points.insert((x, y), Vec::new());
             }
         }
 
@@ -623,46 +686,62 @@ impl PrepareAssetsTask {
 
             for x in x_min.floor() as u32..x_max.ceil() as u32 {
                 for y in y_min.floor() as u32..y_max.ceil() as u32 {
-                    let polygon_indices = metadatas.entry((x, y)).or_insert(Vec::new());
-                    polygon_indices.push(polygon_index as u64);
+                    tile_polygons
+                        .get_mut(&(x, y))
+                        .unwrap()
+                        .push(polygon_index as u64);
                 }
             }
         }
 
+        for (point_index, point) in points.iter().enumerate() {
+            let x = (tiles_across_width as f32 * self.map_x_coord(point.x())).floor() as u32;
+            let y = (tiles_across_height as f32 * self.map_y_coord(point.y())).floor() as u32;
+
+            tile_polygons
+                .get_mut(&(x, y))
+                .unwrap()
+                .push(point_index as u64);
+        }
+
         for x in 0..tiles_across_width {
             for y in 0..tiles_across_height {
-                if let Some(polygon_indices) = metadatas.get(&(x, y)) {
-                    let first_pass_path = format!("{}_{}_{}-first-pass.json", level, x, y);
-                    let first_pass_file = File::open(self.tiles_dir().join(first_pass_path))
-                        .chain_err(|| "Error opening first-pass metadata file")?;
+                let polygon_indices = tile_polygons.get(&(x, y)).unwrap();
+                let point_indices = tile_points.get(&(x, y)).unwrap();
 
-                    let first_pass_metadata: FirstPassTileMetadata =
-                        serde_json::from_reader(first_pass_file)
-                            .chain_err(|| "Error parsing first-pass metadata")?;
+                let first_pass_path = format!("{}_{}_{}-first-pass.json", level, x, y);
+                let first_pass_file = File::open(self.tiles_dir().join(first_pass_path))
+                    .chain_err(|| "Error opening first-pass metadata file")?;
 
-                    let tile_metadata = TileMetadata {
-                        min_elevation: first_pass_metadata.min_elevation,
-                        max_elevation: first_pass_metadata.max_elevation,
-                        polygons: polygon_indices.clone(),
-                    };
+                let first_pass_metadata: FirstPassTileMetadata =
+                    serde_json::from_reader(first_pass_file)
+                        .chain_err(|| "Error parsing first-pass metadata")?;
 
-                    let metadata_path = format!("{}_{}_{}.json", level, x, y);
-                    let metadata_file = File::create(self.tiles_dir().join(metadata_path))
-                        .chain_err(|| "Error creating metadata file")?;
+                let tile_metadata = TileMetadata {
+                    min_elevation: first_pass_metadata.min_elevation,
+                    max_elevation: first_pass_metadata.max_elevation,
+                    polygons: polygon_indices.clone(),
+                    points: point_indices.clone(),
+                };
 
-                    serde_json::to_writer(metadata_file, &tile_metadata)
-                        .chain_err(|| "Error writing out metadata file")?;
-                }
+                let metadata_path = format!("{}_{}_{}.json", level, x, y);
+                let metadata_file = File::create(self.tiles_dir().join(metadata_path))
+                    .chain_err(|| "Error creating metadata file")?;
+
+                serde_json::to_writer(metadata_file, &tile_metadata)
+                    .chain_err(|| "Error writing out metadata file")?;
             }
         }
 
         Ok(())
     }
 
-    fn create_polygon_file(
+    fn create_features_file(
         &self,
         polygons: Vec<geo::Polygon<f32>>,
         polygon_properties: Vec<Properties>,
+        points: Vec<geo::Point<f32>>,
+        point_properties: Vec<Properties>,
     ) -> Result<()> {
         let polygons: Vec<_> = polygons
             .into_iter()
@@ -707,16 +786,62 @@ impl PrepareAssetsTask {
             })
             .collect();
 
-        let polygon_point_data = VectorData {
-            polygons,
-            points: vec![],
-        };
+        let points: Vec<_> = points
+            .into_iter()
+            .zip(point_properties)
+            .map(|(point, properties)| {
+                let coordinates = [self.map_x_coord(point.x()), self.map_y_coord(point.y())];
 
-        let polygon_file = File::create(self.output_dir.join("polygons.json"))
-            .chain_err(|| "Error creating polygon point data file")?;
+                let levels = (0..MAX_LEVEL + 1)
+                    .map(|level| {
+                        let point_x = self.map_x_coord(point.x());
+                        let point_y = self.map_y_coord(point.y());
 
-        serde_json::to_writer(polygon_file, &polygon_point_data)
-            .chain_err(|| "Error writing out metadata file")?;
+                        let tiles_across_width = 2u32.pow(1 + level as u32);
+                        let tiles_across_height = 2u32.pow(level as u32);
+
+                        let tile_x = (tiles_across_width as f32 * point_x).floor();
+                        let tile_min_x = tile_x / tiles_across_width as f32;
+
+                        let tile_y = (tiles_across_height as f32 * point_y).floor();
+                        let tile_min_y = tile_y / tiles_across_height as f32;
+
+                        let tile = format!("{}_{}_{}.pgm", level, tile_x, tile_y);
+                        let tile_width = 1.0 / tiles_across_width as f32;
+                        let tile_height = 1.0 / tiles_across_height as f32;
+
+                        let x_in_tile = (point_x - tile_min_x) / tile_width;
+                        let y_in_tile = (point_y - tile_min_y) / tile_height;
+
+                        let x_in_tile = ELEVATION_TILE_SIZE as f32 * x_in_tile;
+                        let y_in_tile = ELEVATION_TILE_SIZE as f32 * y_in_tile;
+
+                        let x_in_tile = x_in_tile.floor() as u32;
+                        let y_in_tile = ELEVATION_TILE_SIZE - y_in_tile.floor() as u32 - 1;
+
+                        Convert::new()
+                            .input(&self.tiles_dir().join(tile))
+                            .report_value_at_point((x_in_tile, y_in_tile))
+                            .run_with_value()
+                            .unwrap()
+                    })
+                    .collect();
+
+                MultiLevelPoint {
+                    coordinates,
+                    properties,
+                    levels,
+                }
+            })
+            .collect();
+
+        let features_data = FeaturesData { polygons, points };
+
+        let features_file = File::create(self.output_dir.join("features.json"))
+            .chain_err(|| "Error creating features file")?;
+
+        serde_json::to_writer(features_file, &features_data)
+            .chain_err(|| "Error writing out features file")?;
 
         Ok(())
     }

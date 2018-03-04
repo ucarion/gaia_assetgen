@@ -100,6 +100,14 @@ impl Convert {
         self
     }
 
+    // convert assets/generated/tiles/0_0_0.pgm -format '%[fx:p{129,21239} * QuantumRange]' info:
+    pub fn report_value_at_point(&mut self, point: (u32, u32)) -> &mut Convert {
+        let fx_format = format!("%[fx:p{{{},{}}} * QuantumRange]", point.0, point.1);
+
+        self.command.args(&["-format", &fx_format, "info:-"]);
+        self
+    }
+
     pub fn run(&mut self) -> Result<String> {
         let output = self.command
             .output()
@@ -119,5 +127,11 @@ impl Convert {
         let min = f32::from_str(output_parts[0]).unwrap();
         let max = f32::from_str(output_parts[1]).unwrap();
         Ok((min, max))
+    }
+
+    pub fn run_with_value(&mut self) -> Result<f32> {
+        let output = self.run()?;
+        let value = f32::from_str(&output).unwrap();
+        Ok(value)
     }
 }
