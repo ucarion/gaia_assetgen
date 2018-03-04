@@ -129,9 +129,9 @@ impl Convert {
         Ok((min, max))
     }
 
-    pub fn run_with_value(&mut self) -> Result<f32> {
+    pub fn run_with_value(&mut self) -> Result<u16> {
         let output = self.run()?;
-        let value = f32::from_str(&output).unwrap();
+        let value = u16::from_str(&output).unwrap();
         Ok(value)
     }
 }

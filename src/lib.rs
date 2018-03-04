@@ -698,7 +698,7 @@ impl PrepareAssetsTask {
             let x = (tiles_across_width as f32 * self.map_x_coord(point.x())).floor() as u32;
             let y = (tiles_across_height as f32 * self.map_y_coord(point.y())).floor() as u32;
 
-            tile_polygons
+            tile_points
                 .get_mut(&(x, y))
                 .unwrap()
                 .push(point_index as u64);
@@ -819,11 +819,13 @@ impl PrepareAssetsTask {
                         let x_in_tile = x_in_tile.floor() as u32;
                         let y_in_tile = ELEVATION_TILE_SIZE - y_in_tile.floor() as u32 - 1;
 
-                        Convert::new()
+                        let elevation = Convert::new()
                             .input(&self.tiles_dir().join(tile))
                             .report_value_at_point((x_in_tile, y_in_tile))
                             .run_with_value()
-                            .unwrap()
+                            .unwrap();
+
+                        elevation.saturating_sub(ELEVATION_OFFSET) as f32
                     })
                     .collect();
 
